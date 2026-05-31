@@ -3,8 +3,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [jj.majavat :as majavat]
-            [jj.majavat.renderer :as renderer]
-            [jj.sql.async-boa :as boa]
+            [jj.sql.boa :as boa]
             [jj.sql.boa.query.vertx-pg :as vertx-adapter]
             [jj.tassu :refer [GET POST PUT async-route]]
             [jsonista.core :as json]
@@ -17,11 +16,16 @@
            (java.net URI)
            (java.security KeyStore PEMDecoder PrivateKey)
            (java.security.cert Certificate CertificateFactory)
-           (java.util.concurrent Executors)
+           (java.util.concurrent CompletableFuture Executors)
            (java.util.zip GZIPOutputStream))
   (:gen-class))
 
 (def default-executor (Executors/newVirtualThreadPerTaskExecutor))
+
+(defn- on-complete [^CompletableFuture cf on-success on-error]
+  (-> cf
+      (.thenAccept on-success)
+      (.exceptionally (fn [t] (on-error t) nil))))
 
 (def ^:private ^:const ct-json "application/json")
 (def ^:private ^:const ct-text "text/plain")
@@ -55,12 +59,12 @@
 (def ^:private html-headers {hdr-ct ct-html hdr-server server-name})
 
 (def ^:private adapter (vertx-adapter/->VertxPgAdapter))
-(def ^:private pg-query (boa/build-async-query adapter "sql/pg-query"))
-(def ^:private crud-list-query (boa/build-async-query adapter "sql/crud-list"))
-(def ^:private crud-read-query (boa/build-async-query adapter "sql/crud-read"))
-(def ^:private crud-create-query (boa/build-async-query adapter "sql/crud-create"))
-(def ^:private crud-update-query (boa/build-async-query adapter "sql/crud-update"))
-(def ^:private fortunes-query (boa/build-async-query adapter "sql/fortunes"))
+(def ^:private pg-query (boa/build-query adapter "sql/pg-query"))
+(def ^:private crud-list-query (boa/build-query adapter "sql/crud-list"))
+(def ^:private crud-read-query (boa/build-query adapter "sql/crud-read"))
+(def ^:private crud-create-query (boa/build-query adapter "sql/crud-create"))
+(def ^:private crud-update-query (boa/build-query adapter "sql/crud-update"))
+(def ^:private fortunes-query (boa/build-query adapter "sql/fortunes"))
 (def ^:private fortunes-render (majavat/build-html-renderer "fortunes.html"))
 
 
@@ -246,24 +250,23 @@
 
 (defn- handle-pg [pg-pool req respond _raise]
   (let [params (parse-qs (:query-string req))
-        min-p (safe-parse-double (get params param-min) 10.0)
-        max-p (safe-parse-double (get params param-max) 50.0)
-        limit (safe-parse-long (get params param-limit) 50)]
-    (pg-query pg-pool {:min min-p :max max-p :limit limit}
-              (fn [rows]
-                (let [items (map transform-pg-row rows)]
-                  (respond (json-response {:items items :count (count items)}))))
-              (fn [_]
-                (respond (json-response {:items [] :count 0}))))))
+        min-p (safe-parse-int (get params param-min) 10)
+        max-p (safe-parse-int (get params param-max) 50)
+        limit (safe-parse-int (get params param-limit) 50)]
+    (on-complete (pg-query pg-pool [min-p max-p limit])
+                 (fn [rows]
+                   (let [items (map transform-pg-row rows)]
+                     (respond (json-response {:items items :count (count items)}))))
+                 (fn [_]
+                   (respond (json-response {:items [] :count 0}))))))
 
 (defn- handle-fortunes [pg-pool respond raise]
-  (fortunes-query
-    pg-pool
-    (fn [rows]
-      (let [fortunes (sort-by :message (conj rows {:id 0 :message "Additional fortune added at request time."}))
-            body (fortunes-render {:fortunes fortunes})]
-        (respond {:status 200 :headers html-headers :body body})))
-    raise))
+  (on-complete (fortunes-query pg-pool)
+               (fn [rows]
+                 (let [fortunes (sort-by :message (conj rows {:id 0 :message "Additional fortune added at request time."}))
+                       body (fortunes-render {:fortunes fortunes})]
+                   (respond {:status 200 :headers html-headers :body body})))
+               raise))
 
 (def ^:private crud-hit-headers {hdr-ct ct-json hdr-server server-name "X-Cache" "HIT"})
 (def ^:private crud-miss-headers {hdr-ct ct-json hdr-server server-name "X-Cache" "MISS"})
@@ -295,74 +298,74 @@
 (defn- handle-crud-list [pg-pool req respond raise]
   (let [params (parse-qs (:query-string req))
         category (or (get params "category") "electronics")
-        page (max 1 (safe-parse-long (get params "page") 1))
-        limit (max 1 (min 50 (safe-parse-long (get params "limit") 10)))
-        offset (* (dec page) limit)]
-    (crud-list-query pg-pool {:category category :limit limit :offset offset}
-                     (fn [rows]
-                       (let [items (map transform-crud-row rows)]
-                         (respond (json-response {:items items
-                                                  :total (count items)
-                                                  :page  page
-                                                  :limit limit}))))
-                     raise)))
+        page (max 1 (safe-parse-int (get params "page") 1))
+        limit (max 1 (min 50 (safe-parse-int (get params "limit") 10)))
+        offset (int (* (dec page) limit))]
+    (on-complete (crud-list-query pg-pool [category limit offset])
+                 (fn [rows]
+                   (let [items (map transform-crud-row rows)]
+                     (respond (json-response {:items items
+                                              :total (count items)
+                                              :page  page
+                                              :limit limit}))))
+                 raise)))
 
 (defn- handle-crud-read [pg-pool req respond raise]
-  (let [id (safe-parse-long (get-in req [:params :id]) nil)]
+  (let [id (safe-parse-int (get-in req [:params :id]) nil)]
     (if (nil? id)
       (respond {:status 404 :headers json-headers :body not-found-body})
       (if-let [cached (crud-cache-get id)]
         (respond {:status 200 :headers crud-hit-headers :body cached})
-        (crud-read-query pg-pool {:id id}
-                         (fn [rows]
-                           (if-let [row (first rows)]
-                             (let [json-str (json/write-value-as-string (transform-crud-row row))]
-                               (crud-cache-set id json-str)
-                               (respond {:status 200 :headers crud-miss-headers :body json-str}))
-                             (respond {:status 404 :headers json-headers :body not-found-body})))
-                         raise)))))
+        (on-complete (crud-read-query pg-pool [id])
+                     (fn [rows]
+                       (if-let [row (first rows)]
+                         (let [json-str (json/write-value-as-string (transform-crud-row row))]
+                           (crud-cache-set id json-str)
+                           (respond {:status 200 :headers crud-miss-headers :body json-str}))
+                         (respond {:status 404 :headers json-headers :body not-found-body})))
+                     raise)))))
 
 (defn- handle-crud-create [pg-pool req respond raise]
   (let [body (json/read-value (:body req) json/keyword-keys-object-mapper)
-        id (:id body)
+        id (int (or (:id body) 0))
         nm (or (:name body) "New Product")
         category (or (:category body) "test")
-        price (or (:price body) 0)
-        quantity (or (:quantity body) 0)]
-    (crud-create-query pg-pool {:id id :name nm :category category :price price :quantity quantity}
-                       (fn [rows]
-                         (respond {:status  201
-                                   :headers json-headers
-                                   :body    (json/write-value-as-string
-                                              {:id       (:id (first rows))
-                                               :name     nm
-                                               :category category
-                                               :price    price
-                                               :quantity quantity})}))
-                       raise)))
+        price (int (or (:price body) 0))
+        quantity (int (or (:quantity body) 0))]
+    (on-complete (crud-create-query pg-pool [id nm category price quantity])
+                 (fn [rows]
+                   (respond {:status  201
+                             :headers json-headers
+                             :body    (json/write-value-as-string
+                                        {:id       (:id (first rows))
+                                         :name     nm
+                                         :category category
+                                         :price    price
+                                         :quantity quantity})}))
+                 raise)))
 
 (defn- handle-crud-update [pg-pool req respond raise]
-  (let [id (safe-parse-long (get-in req [:params :id]) nil)]
+  (let [id (safe-parse-int (get-in req [:params :id]) nil)]
     (if (nil? id)
       (respond {:status 404 :headers json-headers :body not-found-body})
       (let [body (json/read-value (:body req) json/keyword-keys-object-mapper)
             nm (or (:name body) "Updated")
-            price (or (:price body) 0)
-            quantity (or (:quantity body) 0)]
-        (crud-update-query pg-pool {:name nm :price price :quantity quantity :id id}
-                           (fn [rows]
-                             (if (seq rows)
-                               (do
-                                 (crud-cache-evict id)
-                                 (respond {:status  200
-                                           :headers json-headers
-                                           :body    (json/write-value-as-string
-                                                      {:id       id
-                                                       :name     nm
-                                                       :price    price
-                                                       :quantity quantity})}))
-                               (respond {:status 404 :headers json-headers :body not-found-body})))
-                           raise)))))
+            price (int (or (:price body) 0))
+            quantity (int (or (:quantity body) 0))]
+        (on-complete (crud-update-query pg-pool [nm price quantity id])
+                     (fn [rows]
+                       (if (seq rows)
+                         (do
+                           (crud-cache-evict id)
+                           (respond {:status  200
+                                     :headers json-headers
+                                     :body    (json/write-value-as-string
+                                                {:id       id
+                                                 :name     nm
+                                                 :price    price
+                                                 :quantity quantity})}))
+                         (respond {:status 404 :headers json-headers :body not-found-body})))
+                     raise)))))
 
 (defn- handle-static [req respond _raise]
   (let [name (get-in req [:params :filename])
